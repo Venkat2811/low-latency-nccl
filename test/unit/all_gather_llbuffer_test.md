@@ -127,8 +127,9 @@ Graph is then replayed 16 times, queued without CPU/rank barriers between
 launches. This is **209 checked calls per rank** per invocation.
 
 A GPU producer increments the epoch and regenerates rank-dependent data on
-every call. The final rank is delayed by default. A GPU consumer checks every
-output byte, unchanged separate input data, and leading/trailing guards
+every call. Counter initialization, producers and verifiers use the same
+nonblocking CUDA stream. The final rank is delayed by default. A GPU consumer
+checks every output byte, unchanged separate input data, and leading/trailing guards
 before reuse. Failures accumulate across all graph replays rather than being
 cleared by a later passing call. The final epoch also verifies that the
 requested number of operations actually executed.

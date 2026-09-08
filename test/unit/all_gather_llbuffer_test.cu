@@ -187,8 +187,9 @@ static void ncclTestRunRank(int rank, const ncclTestOptions& options, ncclUnique
   NCCLCHECK(ncclMemAlloc(reinterpret_cast<void**>(&state.output), capacity));
   NCCLCHECK(ncclMemAlloc(reinterpret_cast<void**>(&state.epoch), sizeof(*state.epoch)));
   NCCLCHECK(ncclMemAlloc(reinterpret_cast<void**>(&state.failure), sizeof(*state.failure)));
-  CUDACHECK(cudaMemset(state.epoch, 0, sizeof(*state.epoch)));
-  CUDACHECK(cudaMemset(state.failure, 0, sizeof(*state.failure)));
+  // Initialization and every producer/verifier use the same nonblocking stream.
+  CUDACHECK(cudaMemsetAsync(state.epoch, 0, sizeof(*state.epoch), state.stream));
+  CUDACHECK(cudaMemsetAsync(state.failure, 0, sizeof(*state.failure), state.stream));
   ncclWindow_t inputWindow, outputWindow;
   NCCLCHECK(ncclCommWindowRegister(state.comm, state.input, capacity, &inputWindow,
                                   NCCL_WIN_COLL_SYMMETRIC));
