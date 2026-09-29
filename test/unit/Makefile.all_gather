@@ -7,9 +7,15 @@ NCCL_HOME ?= $(CURDIR)/build
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= sm_90
 TEST_BINARY ?= $(CURDIR)/build/all_gather_llbuffer_test
+PYTHON ?= python3
+TEST_ARGS ?=
 
-.PHONY: all
+.PHONY: all check
 all: $(TEST_BINARY)
+
+check: $(TEST_BINARY)
+	LD_LIBRARY_PATH="$(NCCL_HOME)/lib:$${LD_LIBRARY_PATH}" $(PYTHON) \
+	  test/unit/check_all_gather.py --binary "$(TEST_BINARY)" $(TEST_ARGS)
 
 $(TEST_BINARY): test/unit/all_gather_llbuffer_test.cu examples/common/include/nccl_utils.h
 	mkdir -p $(dir $@)

@@ -4,6 +4,7 @@
 
 // Public-API AllGather regression; Linux, one process per GPU. No MPI required.
 // Build: make -f test/unit/Makefile.all_gather CUDA_ARCH=sm_103
+// Checked run: make -f test/unit/Makefile.all_gather check CUDA_ARCH=sm_103
 // Run with LD_LIBRARY_PATH pointing to the library under test and:
 //   NCCL_CUMEM_ENABLE=1 NCCL_WIN_ENABLE=1 NCCL_NVLS_ENABLE=1 NCCL_GIN_ENABLE=0
 //   NCCL_GRAPH_MIXING_SUPPORT=1 NCCL_SYM_KERNEL=AllGather_LLBufferMC
@@ -263,6 +264,20 @@ static long ncclTestNumber(const char* value, long low, long high) {
   return number;
 }
 
+static void ncclTestStopChildren(std::vector<pid_t>& children) {
+  // Only unreaped children are tracked, so their PIDs cannot be reused.
+  for (pid_t pid : children) {
+    if (pid > 0 && kill(pid, SIGKILL) != 0 && errno != ESRCH) perror("kill");
+  }
+  for (pid_t& pid : children) {
+    if (pid <= 0) continue;
+    pid_t result;
+    do { result = waitpid(pid, nullptr, 0); } while (result < 0 && errno == EINTR);
+    if (result < 0) perror("waitpid during cleanup");
+    pid = 0;
+  }
+}
+
 int main(int argc, char** argv) {
   ncclTestOptions options;
   size_t bytes = 8, offset = 0;
@@ -344,29 +359,26 @@ int main(int argc, char** argv) {
     }
     if (child < 0) {
       perror("fork");
-      for (pid_t pid : children) kill(pid, SIGKILL);
-      for (pid_t pid : children) while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+      ncclTestStopChildren(children);
       return EXIT_FAILURE;
     }
     children.push_back(child);
   }
-  bool failed = false;
   for (int remaining = options.ranks; remaining > 0; --remaining) {
     int status;
     pid_t child;
     do { child = waitpid(-1, &status, 0); } while (child < 0 && errno == EINTR);
     if (child < 0) {
       perror("waitpid");
+      ncclTestStopChildren(children);
       return EXIT_FAILURE;
     }
     for (pid_t& pid : children) if (pid == child) pid = 0;
-    if (!failed && (!WIFEXITED(status) || WEXITSTATUS(status) != 0)) {
-      failed = true;
-      // These are only our unreaped children; their PIDs cannot be reused.
-      for (pid_t pid : children) if (pid > 0) kill(pid, SIGKILL);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      ncclTestStopChildren(children);
+      return EXIT_FAILURE;
     }
   }
-  if (failed) return EXIT_FAILURE;
   code = pthread_barrier_destroy(&shared->barrier);
   if (code) {
     fprintf(stderr, "pthread_barrier_destroy: %s\n", strerror(code));
