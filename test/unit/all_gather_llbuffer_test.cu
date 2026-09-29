@@ -2,8 +2,16 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
-// Public-API regression test. No MPI, PyTorch or SGLang dependency.
-// See all_gather_llbuffer_test.md for build, dispatch checks and limitations.
+// Public-API AllGather regression; Linux, one process per GPU. No MPI required.
+// Build: make -f test/unit/Makefile.all_gather CUDA_ARCH=sm_103
+// Run with LD_LIBRARY_PATH pointing to the library under test and:
+//   NCCL_CUMEM_ENABLE=1 NCCL_WIN_ENABLE=1 NCCL_NVLS_ENABLE=1 NCCL_GIN_ENABLE=0
+//   NCCL_GRAPH_MIXING_SUPPORT=1 NCCL_SYM_KERNEL=AllGather_LLBufferMC
+//   NCCL_SYM_LLBUFFER_SYNC=0 NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=TUNING
+//   timeout --signal=TERM --kill-after=10 120 ./build/all_gather_llbuffer_test --ranks 8
+// Require actual "AllGather [Symmetric]: ... -> Kernel AllGather_LLBufferMC" dispatch;
+// a fallback pass is not evidence for this regression. --help lists test options.
+// Poison-mode data excludes reserved sentinel patterns. This is not a benchmark.
 #include <cuda_runtime.h>
 #include <nccl.h>
 #include <pthread.h>
@@ -21,8 +29,8 @@
 
 #include "../../examples/common/include/nccl_utils.h"
 
-constexpr size_t ncclTestGuard = 128;
-constexpr unsigned char ncclTestCanary = 201;
+constexpr size_t NCCL_TEST_GUARD = 128;
+constexpr unsigned char NCCL_TEST_CANARY = 201;
 
 struct ncclTestCase {
   size_t bytes;
@@ -72,24 +80,24 @@ __global__ void ncclTestAdvance(unsigned long long* epoch, int delayCycles) {
 }
 
 __global__ void ncclTestPrepare(unsigned char* input, unsigned char* output,
-                               unsigned long long* epoch, size_t bytes, size_t start,
-                               int rank, int ranks, bool inPlace) {
+    unsigned long long* epoch, size_t bytes, size_t start,
+    int rank, int ranks, bool inPlace) {
   size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   size_t stride = blockDim.x * gridDim.x;
-  for (size_t i = tid; i < start + bytes + ncclTestGuard; i += stride) {
+  for (size_t i = tid; i < start + bytes + NCCL_TEST_GUARD; i += stride) {
     input[i] = i >= start && i < start + bytes
-      ? ncclTestValue(i - start, *epoch, rank) : ncclTestCanary;
+        ? ncclTestValue(i - start, *epoch, rank) : NCCL_TEST_CANARY;
   }
   size_t ownStart = start + rank * bytes;
-  for (size_t i = tid; i < start + ranks * bytes + ncclTestGuard; i += stride) {
+  for (size_t i = tid; i < start + ranks * bytes + NCCL_TEST_GUARD; i += stride) {
     output[i] = inPlace && i >= ownStart && i < ownStart + bytes
-      ? ncclTestValue(i - ownStart, *epoch, rank) : ncclTestCanary;
+        ? ncclTestValue(i - ownStart, *epoch, rank) : NCCL_TEST_CANARY;
   }
 }
 
 __device__ void ncclTestCheckByte(ncclTestFailure* failure, unsigned char actual,
-                                unsigned char expected, size_t index, int region,
-                                int caseId, unsigned long long epoch) {
+    unsigned char expected, size_t index, int region,
+    int caseId, unsigned long long epoch) {
   if (actual != expected && atomicAdd(&failure->count, 1ull) == 0) {
     failure->epoch = epoch;
     failure->index = index;
@@ -101,17 +109,17 @@ __device__ void ncclTestCheckByte(ncclTestFailure* failure, unsigned char actual
 }
 
 __global__ void ncclTestVerify(unsigned char* input, unsigned char* output,
-                              unsigned long long* epoch, ncclTestFailure* failure,
-                              size_t bytes, size_t start, int rank, int ranks, int caseId) {
+    unsigned long long* epoch, ncclTestFailure* failure,
+    size_t bytes, size_t start, int rank, int ranks, int caseId) {
   size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   size_t stride = blockDim.x * gridDim.x;
-  for (size_t i = tid; i < start + bytes + ncclTestGuard; i += stride) {
+  for (size_t i = tid; i < start + bytes + NCCL_TEST_GUARD; i += stride) {
     unsigned char expected = i >= start && i < start + bytes
-      ? ncclTestValue(i - start, *epoch, rank) : ncclTestCanary;
+        ? ncclTestValue(i - start, *epoch, rank) : NCCL_TEST_CANARY;
     ncclTestCheckByte(failure, input[i], expected, i, 0, caseId, *epoch);
   }
-  for (size_t i = tid; i < start + ranks * bytes + ncclTestGuard; i += stride) {
-    unsigned char expected = ncclTestCanary;
+  for (size_t i = tid; i < start + ranks * bytes + NCCL_TEST_GUARD; i += stride) {
+    unsigned char expected = NCCL_TEST_CANARY;
     if (i >= start && i < start + ranks * bytes) {
       size_t index = i - start;
       expected = ncclTestValue(index % bytes, *epoch, static_cast<int>(index / bytes));
@@ -132,39 +140,41 @@ struct ncclTestRank {
 
 static void ncclTestEnqueue(ncclTestRank& state, const ncclTestOptions& options, int caseId) {
   auto test = options.cases[caseId];
-  size_t start = ncclTestGuard + test.offset;
+  size_t start = NCCL_TEST_GUARD + test.offset;
   int ranks = options.ranks;
   int delay = state.rank == ranks - 1 ? options.delayCycles : 0;
   bool inPlace = options.inPlace;
   void* advanceArgs[] = {&state.epoch, &delay};
   CUDACHECK(cudaLaunchKernel(reinterpret_cast<const void*>(ncclTestAdvance),
-                            dim3(1), dim3(1), advanceArgs, 0, state.stream));
+          dim3(1), dim3(1), advanceArgs, 0, state.stream));
   void* prepareArgs[] = {&state.input, &state.output, &state.epoch, &test.bytes,
-                         &start, &state.rank, &ranks, &inPlace};
+          &start, &state.rank, &ranks, &inPlace
+      };
   CUDACHECK(cudaLaunchKernel(reinterpret_cast<const void*>(ncclTestPrepare),
-                            dim3(32), dim3(256), prepareArgs, 0, state.stream));
+          dim3(32), dim3(256), prepareArgs, 0, state.stream));
   unsigned char* send = inPlace ? state.output + start + state.rank * test.bytes
-                               : state.input + start;
+      : state.input + start;
   NCCLCHECK(ncclAllGather(send, state.output + start, test.bytes, ncclUint8,
-                         state.comm, state.stream));
+          state.comm, state.stream));
   void* verifyArgs[] = {&state.input, &state.output, &state.epoch, &state.failure,
-                        &test.bytes, &start, &state.rank, &ranks, &caseId};
+          &test.bytes, &start, &state.rank, &ranks, &caseId
+      };
   CUDACHECK(cudaLaunchKernel(reinterpret_cast<const void*>(ncclTestVerify),
-                            dim3(32), dim3(256), verifyArgs, 0, state.stream));
+          dim3(32), dim3(256), verifyArgs, 0, state.stream));
 }
 
 static void ncclTestInspect(ncclTestRank& state, const ncclTestOptions& options,
-                            const char* phase) {
+    const char* phase) {
   CUDACHECK(cudaStreamSynchronize(state.stream));
   ncclTestFailure failure;
   CUDACHECK(cudaMemcpy(&failure, state.failure, sizeof(failure), cudaMemcpyDeviceToHost));
   if (failure.count != 0) {
     auto test = options.cases[failure.caseId];
     fprintf(stderr, "FAIL rank=%d phase=%s bytes=%zu offset=%zu epoch=%llu "
-            "region=%s index=%zu actual=%u expected=%u mismatches=%llu\n",
-            state.rank, phase, test.bytes, test.offset, failure.epoch,
-            failure.region == 0 ? "input" : "output", failure.index,
-            failure.actual, failure.expected, failure.count);
+        "region=%s index=%zu actual=%u expected=%u mismatches=%llu\n",
+        state.rank, phase, test.bytes, test.offset, failure.epoch,
+        failure.region == 0 ? "input" : "output", failure.index,
+        failure.actual, failure.expected, failure.count);
     // A failed rank must terminate the process, not strand other ranks at a
     // barrier. The external timeout additionally bounds kernel hangs.
     exit(EXIT_FAILURE);
@@ -172,7 +182,7 @@ static void ncclTestInspect(ncclTestRank& state, const ncclTestOptions& options,
 }
 
 static void ncclTestRunRank(int rank, const ncclTestOptions& options, ncclUniqueId id,
-                            pthread_barrier_t* barrier) {
+    pthread_barrier_t* barrier) {
   CUDACHECK(cudaSetDevice(rank));
   ncclTestRank state{};
   state.rank = rank;
@@ -180,7 +190,7 @@ static void ncclTestRunRank(int rank, const ncclTestOptions& options, ncclUnique
   CUDACHECK(cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking));
   size_t capacity = 0;
   for (auto test : options.cases) {
-    capacity = std::max(capacity, test.offset + options.ranks * test.bytes + 2 * ncclTestGuard);
+    capacity = std::max(capacity, test.offset + options.ranks * test.bytes + 2 * NCCL_TEST_GUARD);
   }
   // Equal allocation sizes and collective registration on every rank.
   NCCLCHECK(ncclMemAlloc(reinterpret_cast<void**>(&state.input), capacity));
@@ -192,9 +202,9 @@ static void ncclTestRunRank(int rank, const ncclTestOptions& options, ncclUnique
   CUDACHECK(cudaMemsetAsync(state.failure, 0, sizeof(*state.failure), state.stream));
   ncclWindow_t inputWindow, outputWindow;
   NCCLCHECK(ncclCommWindowRegister(state.comm, state.input, capacity, &inputWindow,
-                                  NCCL_WIN_COLL_SYMMETRIC));
+          NCCL_WIN_COLL_SYMMETRIC));
   NCCLCHECK(ncclCommWindowRegister(state.comm, state.output, capacity, &outputWindow,
-                                  NCCL_WIN_COLL_SYMMETRIC));
+          NCCL_WIN_COLL_SYMMETRIC));
   for (size_t c = 0; c < options.cases.size(); ++c) {
     for (int repeat = 0; repeat < options.eager; ++repeat) {
       ncclTestBarrier(barrier);
@@ -230,7 +240,7 @@ static void ncclTestRunRank(int rank, const ncclTestOptions& options, ncclUnique
     exit(EXIT_FAILURE);
   }
   printf("PASS rank=%d checks=%zu eager=%d graph_replays=%d in_place=%d\n",
-         rank, checks, options.eager, options.graphs, options.inPlace);
+      rank, checks, options.eager, options.graphs, options.inPlace);
   ncclTestBarrier(barrier);
   NCCLCHECK(ncclCommWindowDeregister(state.comm, outputWindow));
   NCCLCHECK(ncclCommWindowDeregister(state.comm, inputWindow));
@@ -262,7 +272,7 @@ int main(int argc, char** argv) {
       options.inPlace = true;
     } else if (!strcmp(argv[i], "--help")) {
       printf("Usage: %s [--ranks N] [--bytes N --offset N] [--eager N] "
-             "[--graphs N] [--delay-cycles N] [--in-place]\n", argv[0]);
+          "[--graphs N] [--delay-cycles N] [--in-place]\n", argv[0]);
       return 0;
     } else if (i + 1 < argc) {
       const char* key = argv[i++];
@@ -295,7 +305,7 @@ int main(int argc, char** argv) {
     pthread_barrier_t barrier;
   };
   auto* shared = static_cast<ncclTestShared*>(mmap(nullptr, sizeof(ncclTestShared),
-    PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+              PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0));
   if (shared == MAP_FAILED) {
     perror("mmap");
     return EXIT_FAILURE;
@@ -324,8 +334,8 @@ int main(int argc, char** argv) {
         NCCLCHECK(ncclGetVersion(&version));
         NCCLCHECK(ncclGetUniqueId(&shared->id));
         printf("CONFIG nccl=%d ranks=%d cases=%zu eager=%d graph_replays=%d in_place=%d\n",
-               version, options.ranks, options.cases.size(), options.eager, options.graphs,
-               options.inPlace);
+            version, options.ranks, options.cases.size(), options.eager, options.graphs,
+            options.inPlace);
         fflush(stdout);
       }
       ncclTestBarrier(&shared->barrier);
@@ -367,6 +377,6 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
   printf("ALL_PASS ranks=%d total_checks=%zu\n", options.ranks,
-         options.ranks * options.cases.size() * (options.eager + options.graphs));
+      options.ranks * options.cases.size() * (options.eager + options.graphs));
   return 0;
 }
